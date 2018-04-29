@@ -48,6 +48,13 @@ struct paging_structures hv_paging_structs = {
 	.root_table = (page_table_t)hv_paging_root,
 };
 
+static __attribute__((aligned(PAGE_SIZE))) u8 parking_root[PAGE_SIZE];
+
+/** Descriptor of paging structures used when parking CPUs. */
+struct paging_structures parking_pt = {
+	.root_table = (page_table_t)parking_root,
+};
+
 /**
  * Trivial implementation of paging::get_phys (for non-terminal levels)
  * @param pte See paging::get_phys.
