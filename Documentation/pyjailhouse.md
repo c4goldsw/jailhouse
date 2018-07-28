@@ -55,6 +55,6 @@ For the example, the following wouldn't work inside of boz.py:
 `
 sys.path[0] = os.path.dirname(os.path.abspath(__file__)) + ""
 from pyjailhouse import
-# Imports from directory containing this must be done above
-# import statement, see python documentation on sys.path[0]
+# Imports from directory containing this script must be done above the
+# line setting sys.path[0], see python documentation on sys.path[0]
 `

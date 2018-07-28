@@ -16,8 +16,15 @@ import mmap
 import os
 import struct
 import sys
+import argparse
 
 check_passed = True
+iommu = None
+
+sys.path[0] = os.path.dirname(os.path.abspath(__file__)) + "/.."
+import pyjailhouse.sysfs_parsers as sp
+# Imports from directory containing this script must be done above the
+# line setting sys.path[0], see python documentation on sys.path[0]
 
 
 def check_feature(msg, ok, optional=False):
@@ -137,7 +144,7 @@ class Sysconfig:
                          Sysconfig.PCIISVIRT_SIZE + Sysconfig.PCIDOMAIN_SIZE +
                          Sysconfig.X86_PADDING)
 
-        keys = 'base size amd_bdf amd_base_cap amd_features'
+        keys = 'base_addr mmio_size amd_bdf amd_base_cap amd_features'
         IOMMU = collections.namedtuple('IOMMU', keys)
 
         iommus = []
@@ -148,23 +155,34 @@ class Sysconfig:
         return iommus
 
 
-def usage(exit_code):
-    prog = os.path.basename(sys.argv[0]).replace('-', ' ')
-    print('usage: %s SYSCONFIG' % prog)
-    sys.exit(exit_code)
-
-
-if len(sys.argv) != 2:
-    usage(1)
-if sys.argv[1] in ("--help", "-h"):
-    usage(0)
+parser = argparse.ArgumentParser(description="Determine if this machine is "
+                                 "capable of running Jailhouse. By default, "
+                                 "this script pulls information from sysfs "
+                                 "to determine this. You can also provide a "
+                                 "root cell configuration, whose information "
+                                 "will be used instead of what comes from "
+                                 "sysfs.",
+                                 usage="jailhouse hardware check "
+                                 "[--root <dir> | --sysconfig <sysconfig>]")
+parser.add_argument("--sysconfig",
+                    help="sysconfig file to check")
+parser.add_argument("--root",
+                    help="root directory from which sysfs files should be "
+                         "read",
+                    default="/")
+arg = parser.parse_args()
 
 if os.uname()[4] not in ('x86_64', 'i686'):
     print('Unsupported architecture', file=sys.stderr)
     sys.exit(1)
 
-config = Sysconfig(sys.argv[1])
-iommu = config.parse_iommus()
+if arg.sysconfig is not None:
+    config = Sysconfig(arg.sysconfig)
+    iommu = config.parse_iommus()
+else:
+    sp.root_dir = arg.root
+    ioapics = sp.parse_madt()
+    pci_devices, _, _ = sp.parse_pcidevices()
 
 (cpu_vendor, cpu_features, cpu_count) = parse_cpuinfo()
 
@@ -180,6 +198,10 @@ check_feature('Number of CPUs > 1', cpu_count > 1)
 check_feature('Long mode', 'lm' in cpu_features)
 
 if cpu_vendor == 'GenuineIntel':
+    if iommu is None:
+        _, dmar_regions = sp.parse_iomem(pci_devices)
+        iommu, _ = sp.parse_dmar(pci_devices, ioapics, dmar_regions)
+
     check_feature('x2APIC', 'x2apic' in cpu_features, True)
     print()
     check_feature('VT-x (VMX)', 'vmx' in cpu_features)
@@ -229,14 +251,14 @@ if cpu_vendor == 'GenuineIntel':
     check_feature('  Activity state HLT',
                   msr.read(MSR.IA32_VMX_MISC) & (1 << 6))
 
-    for n in range(8):
-        if iommu[n].base == 0 and n > 0:
+    for n in range(len(iommu)):
+        if iommu[n].base_addr == 0 and n > 0:
             break
         print()
-        check_feature('VT-d (IOMMU #%d)' % n, iommu[n].base)
-        if iommu[n].base == 0:
+        check_feature('VT-d (IOMMU #%d)' % n, iommu[n].base_addr)
+        if iommu[n].base_addr == 0:
             break
-        mmio = MMIO(iommu[n].base, iommu[n].size)
+        mmio = MMIO(iommu[n].base_addr, iommu[n].mmio_size)
         cap = mmio.read64(0x08)
         check_feature('  39-bit AGAW', cap & (1 << 9), cap & (1 << 10))
         check_feature('  48-bit AGAW', cap & (1 << 10), cap & (1 << 9))
@@ -249,6 +271,9 @@ if cpu_vendor == 'GenuineIntel':
                       'x2apic' not in cpu_features)
 
 elif cpu_vendor == 'AuthenticAMD':
+    if iommu is None:
+        iommu, _ = sp.parse_ivrs(pci_devices, ioapics)
+
     print()
     check_feature('AMD-V (SVM)', 'svm' in cpu_features)
     check_feature('  NPT', 'npt' in cpu_features)
@@ -257,11 +282,11 @@ elif cpu_vendor == 'AuthenticAMD':
     check_feature('  Flush by ASID', 'flushbyasid' in cpu_features, True)
 
     for n in range(8):
-        if iommu[n].base == 0 and n > 0:
+        if iommu[n].base_addr == 0 and n > 0:
             break
         print()
-        check_feature('AMD-Vi (IOMMU #%d)' % n, iommu[n].base)
-        if iommu[n].base == 0:
+        check_feature('AMD-Vi (IOMMU #%d)' % n, iommu[n].base_addr)
+        if iommu[n].base_addr == 0:
             break
 
         bdf = iommu[n].amd_bdf
@@ -274,9 +299,9 @@ elif cpu_vendor == 'AuthenticAMD':
         check_feature('  Extended feature register', caps & (1 << 27))
         check_feature('  Valid base register',
                       (base & (1 << 0)) == 0 or
-                      base == (iommu[n].base | (1 << 0)))
+                      base == (iommu[n].base_addr | (1 << 0)))
 
-        mmio = MMIO(iommu[n].base, iommu[n].size)
+        mmio = MMIO(iommu[n].base_addr, iommu[n].mmio_size)
         efr = mmio.read64(0x30)
         if check_feature('  SMI filter', ((efr >> 16) & 0x3) == 1):
             smi_filter_ok = True
