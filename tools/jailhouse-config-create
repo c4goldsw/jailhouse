@@ -25,6 +25,10 @@ import math
 import re
 import argparse
 import struct
+# Though directly unused, importing readline indirectly / automatically
+# provides added abilities to input() / raw_input() (e.g. using arrow keys
+# provides previous input)
+import readline
 
 try:
     from mako.template import Template
@@ -69,6 +73,10 @@ parser.add_argument('-c', '--console',
                     default='ttyS0',
                     action='store',
                     type=str)
+parser.add_argument('--create-non-root',
+                    help='In addition to creating the root cell, create '
+                         'non-root cells',
+                    action="store_true")
 
 memargs = [['--mem-inmates', '76M', 'inmate'],
            ['--mem-hv', '6M', 'hypervisor']]
@@ -306,27 +314,154 @@ pm_timer_base = parse_ioports()
 
 debug_console = DebugConsole(options.console)
 
+######################################
 
-f = open(options.file, 'w')
-tmpl = Template(filename=os.path.join(options.template_dir,
-                                      'root-cell-config.c.tmpl'))
-kwargs = {
-    'regions': regions,
-    'ourmem': ourmem,
-    'argstr': ' '.join(sys.argv),
-    'hvmem': hvmem,
-    'product': product,
-    'pcidevices': pcidevices,
-    'pcicaps': pcicaps,
-    'cpucount': cpucount,
-    'irqchips': ioapics,
-    'pm_timer_base': pm_timer_base,
-    'vtd_interrupt_limit': vtd_interrupt_limit,
-    'mmconfig': mmconfig,
-    'iommu_units': iommu_units,
-    'debug_console': debug_console,
-}
 
-f.write(tmpl.render(**kwargs))
+def get_input():  # input() in Python3 == raw_input() in Python2
+    # TODO: try / except block, loop used for development purposes, remove
+    while True:
+        try:
+            if sys.version_info[0] == 2:
+                return raw_input()
+            else:  # version_info[0] == 3
+                return input()
+        except EOFError:
+            continue
 
-f.close()
+
+def get_integer_input(prompt):
+    while True:
+        print(prompt)
+        try:
+            val = int(get_input())
+            if val <= 0:
+                print("Inputed value needs to be a positive integer\n")
+                continue
+        except ValueError:
+            print("Inputed value needs to be an integer\n")
+            continue
+
+        return val
+
+
+if options.create_non_root:
+    still_creating_cell = True
+    available_cpus = set([i for i in range(cpucount)])
+    used_names = []
+
+    while still_creating_cell:
+        name = ""
+        cpu_bitmaps = []  # Array of CPU bitmap strings
+
+        # Choose name
+        print("\n=======\nName\n=======")
+        while True:
+            print("Enter a unique name for this cell:")
+            name = get_input()
+            if name in used_names:
+                print("%s is already in use as a cell name" % name)
+                continue
+            used_names.append(name)
+            break
+
+        print("\n=======\nCPU Set\n=======")
+        # Get CPUs
+        while True:
+            cpu_ids_correct = True
+            print("The following CPUs are available:")
+            print(available_cpus)
+            print("Enter a comma separated list of the ones you want - "
+                  "'..' can be used to indicate a range of cpus (e.g., "
+                  "'0..3, 7' is equivalent to '0, 1, 2, 3, 7'):")
+            cpu_ids = get_input().split(",")
+
+            # Expand all ranges, make sure all inputs are integers
+            for i in range(len(cpu_ids) - 1, -1, -1):
+                try:
+                    if ".." in cpu_ids[i]:
+                        arr = cpu_ids[i].split("..")
+                        cpu_ids += range(int(arr[0]), int(arr[1]) + 1)
+                        del cpu_ids[i:i+1]
+                    else:
+                        int(cpu_ids[i])
+
+                except ValueError:
+                    print("Entered CPU ID / range (%s) has non-integer "
+                          "values" % cpu_ids[i])
+                    cpu_ids_correct = False
+                    break
+
+            # cpu_ids now a list of integers, check that intersection of
+            # cpu_ids and available_cpus is non-empty, then reserve CPUs
+            # in intersection
+            if cpu_ids_correct:
+                cpu_ids = set([int(cpu_id) for cpu_id in cpu_ids]) & \
+                    available_cpus
+
+                if len(cpu_ids) == 0:
+                    print("None of the CPUs you chose are available.")
+                    continue
+
+                available_cpus = available_cpus - cpu_ids
+
+                # Create needed number of 16 hex digit bitmaps indicating
+                # CPUs are in use
+                chosen_cpus = 0
+                for cpu in cpu_ids:
+                    chosen_cpus += 2**cpu
+
+                while chosen_cpus != 0:
+                    cpu_bitmaps.append('0x%016x' % (chosen_cpus % 2**64))
+                    chosen_cpus = chosen_cpus // (2**64)
+
+                break
+
+        # Write out config
+        with open(name + ".c", 'w') as f:
+            tmpl = Template(filename=os.path.join(options.template_dir,
+                            'non-root-cell-config.c.tmpl'))
+            kwargs = {
+                'name': name,
+                'cpu_bitmaps': cpu_bitmaps
+            }
+            f.write(tmpl.render(**kwargs))
+
+        # Check for resources - if they're all exhausted, exit
+        if len(available_cpus) == 0:
+            print("All CPUs are now marked as reserved, finishing")
+            break
+
+        while True:
+            print("\nWould you like to create another non-root cell [y/n]")
+            s = get_input().lower()
+            if s != "y" and s != "n":
+                continue
+            if s == "n":
+                still_creating_cell = False
+            print("")
+            break
+
+######################################
+
+# Write out root cell
+with open(options.file, 'w') as f:
+    tmpl = Template(filename=os.path.join(options.template_dir,
+                                          'root-cell-config.c.tmpl'))
+    kwargs = {
+        'regions': regions,
+        'ourmem': ourmem,
+        'argstr': ' '.join(sys.argv),
+        'hvmem': hvmem,
+        'product': product,
+        'pcidevices': pcidevices,
+        'pcicaps': pcicaps,
+        'cpucount': cpucount,
+        'irqchips': ioapics,
+        'pm_timer_base': pm_timer_base,
+        'vtd_interrupt_limit': vtd_interrupt_limit,
+        'mmconfig': mmconfig,
+        'iommu_units': iommu_units,
+        'debug_console': debug_console,
+    }
+
+    f.write(tmpl.render(**kwargs))

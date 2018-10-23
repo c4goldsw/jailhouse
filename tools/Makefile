@@ -40,7 +40,8 @@ HELPERS := \
 	jailhouse-cell-stats \
 	jailhouse-config-create \
 	jailhouse-hardware-check
-TEMPLATES := jailhouse-config-collect.tmpl root-cell-config.c.tmpl
+TEMPLATES := jailhouse-config-collect.tmpl root-cell-config.c.tmpl \
+				non-root-cell-config.c.tmpl
 
 install-libexec: $(HELPERS) $(DESTDIR)$(libexecdir)/jailhouse
 	$(INSTALL_PROGRAM) $^
