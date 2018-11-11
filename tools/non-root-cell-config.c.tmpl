@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2014-2017
+ * Copyright (c) Siemens AG, 2013-2017
  * Copyright (c) Christopher Goldsworthy, 2018
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
@@ -42,6 +42,7 @@
 struct {
     struct jailhouse_cell_desc cell;
     __u64 cpus[${len(cpu_bitmaps)}];
+    struct jailhouse_memory mem_regions[${len(chosen_mem_regions)}];
 } __attribute__((packed)) config = {
     .cell = {
         .signature = JAILHOUSE_CELL_DESC_SIGNATURE,
@@ -50,7 +51,7 @@ struct {
         .flags = 0,
 
         .cpu_set_size = sizeof(config.cpus),
-        .num_memory_regions = 0,
+        .num_memory_regions = ARRAY_SIZE(config.mem_regions),
         .num_cache_regions = 0,
         .num_irqchips = 0,
         .pio_bitmap_size = 0,
@@ -60,6 +61,19 @@ struct {
     .cpus = {
         % for bitmap in cpu_bitmaps:
         ${bitmap},
+        % endfor
+    },
+
+    .mem_regions = {
+        % for r in chosen_mem_regions:
+        /* ${str(r)} */
+        /* ${r.comments} */
+        {
+            .phys_start = ${hex(r.start)},
+            .virt_start = ${hex(r.virt_start)},
+            .size = ${hex(r.size())},
+            .flags = ${r.flagstr('\t\t')},
+        },
         % endfor
     },
 };

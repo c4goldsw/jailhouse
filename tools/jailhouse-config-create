@@ -317,16 +317,42 @@ debug_console = DebugConsole(options.console)
 ######################################
 
 
+def print_remaining_regions(remaining_regions):
+    print("\nThe following region(s) of physical memory are available:\n")
+    for i in range(len(remaining_regions)):
+        print(str(i) + ": " + str(remaining_regions[i]))
+    print("")
+
+
 def get_input():  # input() in Python3 == raw_input() in Python2
-    # TODO: try / except block, loop used for development purposes, remove
     while True:
+        if sys.version_info[0] == 2:
+            inp = raw_input()
+        else:  # version_info[0] == 3
+            inp = input()
+
+        return inp
+
+
+def get_addr_input(addr_type):
+    while True:
+        print("\nWhat should the %s address of this "
+              "region be? Please input an address in hex that lies within a "
+              "64-bit addresses space, e.g. \"DEADBEEF\":" % addr_type)
+        starting_addr = get_input()
+
         try:
-            if sys.version_info[0] == 2:
-                return raw_input()
-            else:  # version_info[0] == 3
-                return input()
-        except EOFError:
+            starting_addr = int(starting_addr, 16)
+            if starting_addr < 0 or starting_addr > (2**64) - 1:
+                print("The inputted address (%d) must doesn't fall in a "
+                      "64-bit address range.\n" % starting_addr)
+                continue
+        except ValueError:
+            print("The inputted address (%s) is not a hex string.\n" %
+                  starting_addr)
             continue
+
+        return starting_addr
 
 
 def get_integer_input(prompt):
@@ -344,14 +370,121 @@ def get_integer_input(prompt):
         return val
 
 
+def allocate_region(remaining_regions, chosen_regions, name):
+    phys_start = get_addr_input("starting physical")
+    phys_end = get_addr_input("ending physical")
+    virt_start = get_addr_input("starting virtual (guest physical)")
+
+    new_reg = sysfs_parser.MemRegion(phys_start, phys_end, 'System RAM',
+                                     virt_start=virt_start, comments=name)
+
+    # =======================
+    # Physical address checks
+    # =======================
+
+    if (phys_end < phys_start):
+        print("The starting physical address (%08x) is greater than the "
+              "ending physical address (%08x)" % (phys_start, phys_end))
+        return False
+
+    # Check to see that phyiscal addr lies within a block
+    highest_p_addr_reg = -1  # Index of phys addr region we want to break up
+    for i in range(len(remaining_regions)):
+        if new_reg.start < remaining_regions[i].start:
+            break
+        highest_p_addr_reg = i
+
+    if highest_p_addr_reg == -1:
+        print("The starting address for this physical region (%08x) is "
+              "less than the starting addr. of the lowest-physically "
+              "addressed available region (%08x)" %
+              (new_reg.start, remaining_regions[0].start))
+        return False
+
+    intersecting_p_reg = remaining_regions[highest_p_addr_reg]
+    if intersecting_p_reg.stop < new_reg.stop:
+        print("Selected physical region (%08x - %08x) does not lie "
+              "within the bounds of a free region" %
+              (phys_start, phys_end))
+        return False
+
+    # =======================
+    # Virtual address checks
+    # =======================
+
+    # Check to see that v-addr doesn't intersect currently assigned block
+    highest_v_addr_reg = 0  # Index of v-addr region to come after new_reg
+    for i in range(len(chosen_regions)):
+        l_bound_overlap = new_reg.virt_start < chosen_regions[i].virt_start + \
+            chosen_regions[i].size() and chosen_regions[i].virt_start <= \
+            new_reg.virt_start
+
+        r_bound_overlap = chosen_regions[i].virt_start < new_reg.virt_start + \
+            new_reg.size() and new_reg.virt_start + new_reg.size() <= \
+            chosen_regions[i].virt_start + chosen_regions[i].size()
+
+        if l_bound_overlap or r_bound_overlap:
+            print("Selected virtual region (%08x - %08x) intersects an "
+                  "already allocated virtual region\n" % (new_reg.virt_start,
+                                                          new_reg.virt_start +
+                                                          new_reg.size() - 1))
+            return False
+
+        if new_reg.virt_start + new_reg.size() <= chosen_regions[i].virt_start:
+            break
+        highest_v_addr_reg += 1
+
+    # =======================
+    # Create regions
+    # =======================
+
+    # Break up remaining_regions
+
+    # We're using the entire region, delete it
+    if new_reg.start == intersecting_p_reg.start and \
+            new_reg.size() == intersecting_p_reg.size():
+        del remaining_regions[highest_p_addr_reg:highest_p_addr_reg + 1]
+
+    # We're using one of two endpoints of the enclosing physical region, shrink
+    # the region accordingly
+    elif new_reg.start == intersecting_p_reg.start:
+        intersecting_p_reg.start += new_reg.size()
+
+    elif new_reg.start + new_reg.size() == intersecting_p_reg.start + \
+            intersecting_p_reg.size():
+        intersecting_p_reg.stop = new_reg.start - 1
+
+    # The requested region uses neither endpoint of the containing region,
+    # break it up into two new regions
+    else:
+        new_phys_reg = sysfs_parser.MemRegion(intersecting_p_reg.start,
+                                              new_reg.start - 1,
+                                              'System RAM', comments=name,
+                                              virt_start=virt_start)
+        remaining_regions.insert(highest_p_addr_reg, new_phys_reg)
+        intersecting_p_reg.start = new_reg.stop + 1
+
+    # Add a new block to chosen_regions (sorted by v-addr)
+    chosen_regions.insert(highest_v_addr_reg, new_reg)
+
+    return True
+
+
 if options.create_non_root:
     still_creating_cell = True
     available_cpus = set([i for i in range(cpucount)])
+    # Array of physical regions a guest can use for RAM. Last element of
+    # regions array contains memory set aside for guest RAM.
+    remaining_regions = [regions[-1]]
+    remaining_regions[0].typestr = "System RAM"
     used_names = []
 
     while still_creating_cell:
         name = ""
         cpu_bitmaps = []  # Array of CPU bitmap strings
+        chosen_regions = []  # Array of memory (for RAM) reserved for a guest
+                             # TODO/ note: currently ordered by virtual address
+                             # due to the way array is used in allocate_region
 
         # Choose name
         print("\n=======\nName\n=======")
@@ -416,19 +549,48 @@ if options.create_non_root:
 
                 break
 
+        # Get RAM
+        print("\n=======\nRAM\n=======")
+        print_remaining_regions(remaining_regions)
+
+        num_regions = get_integer_input("How many regions would you like "
+                                        "to create from it (must select "
+                                        "at least one region)?")
+
+        for i in range(num_regions):
+            print("\n=======\nRegion %d\n=======" % (i + 1))
+            print("Choose a name for this region (optional, only appears "
+                  "as comment in generated file):")
+            region_name = get_input()
+
+            while True:
+                if allocate_region(remaining_regions, chosen_regions,
+                                   region_name):
+                    break
+
+            if len(remaining_regions) == 0:
+                break
+
+            print_remaining_regions(remaining_regions)
+
         # Write out config
         with open(name + ".c", 'w') as f:
             tmpl = Template(filename=os.path.join(options.template_dir,
                             'non-root-cell-config.c.tmpl'))
             kwargs = {
                 'name': name,
-                'cpu_bitmaps': cpu_bitmaps
+                'cpu_bitmaps': cpu_bitmaps,
+                'chosen_mem_regions': chosen_regions
             }
             f.write(tmpl.render(**kwargs))
 
         # Check for resources - if they're all exhausted, exit
         if len(available_cpus) == 0:
             print("All CPUs are now marked as reserved, finishing")
+            break
+
+        if len(remaining_regions) == 0:
+            print("All inmate RAM is now depleted, finishing")
             break
 
         while True:

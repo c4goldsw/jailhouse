@@ -726,10 +726,12 @@ class PCIPCIBridge(PCIDevice):
 
 
 class MemRegion:
-    def __init__(self, start, stop, typestr, comments=None):
+    def __init__(self, start, stop, typestr, virt_start=-1, comments=None):
         self.start = start
         self.stop = stop
         self.typestr = typestr
+        if virt_start != -1:
+            self.virt_start = virt_start
         self.comments = comments or []
 
     def __str__(self):
@@ -737,8 +739,7 @@ class MemRegion:
             (self.start, self.stop, self.typestr)
 
     def size(self):
-        # round up to full PAGE_SIZE
-        return int((self.stop - self.start + 0xfff) / 0x1000) * 0x1000
+        return self.stop - self.start + 1
 
     def flagstr(self, p=''):
         if (
