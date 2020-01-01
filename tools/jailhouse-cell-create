@@ -1,0 +1,479 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import argparse
+import os
+import sys
+# Imports from directory containing this must be done before the following
+sys.path[0] = os.path.dirname(os.path.abspath(__file__)) + "/.."
+import pyjailhouse.sysfs_parser as sysfs_parser
+
+# __u32 num_cache_regions;
+# __u32 num_irqchips;
+
+# TODO: move count_cpus() into sysfs_parser
+def allocate_cpus(cpu_str):
+    cpu_ids = set()
+    cpu_str_arr = cpu_str.split(",")
+    max_cpu_id = sysfs_parser.count_cpus()
+
+    # Expand all ranges, make sure all inputs are integers
+    for i in range(len(cpu_str_arr) - 1, -1, -1):
+        try:
+            if "-" in cpu_str_arr[i]:
+                cpu_id_range = cpu_str_arr[i].split("-")
+
+                # Make sure cpu_id_range is a two element array of integers
+                # s.t. cpu_id_range[0] < cpu_id_range[1]
+                if len(cpu_id_range) != 2 or cpu_id_range[0] > cpu_id_range[1]:
+                    print("The range of CPU IDs '%s' is not formated "
+                          "correctly." % cpu_str_arr[i])
+                    sys.exit(1)
+
+                # Check that the range of IDs are actually valid
+                start_id = int(cpu_id_range[0])
+                end_id = int(cpu_id_range[1])
+                if start_id < 0 or end_id >= max_cpu_id:
+                    print("The range of CPU IDs '%s' is not a valid.  The "
+                          "valid CPU IDs of this machine are those in the "
+                          "range 0 - %d" % (cpu_str_arr[i], max_cpu_id))
+                    sys.exit(1)
+                cpu_ids.add(range(int(cpu_id_range[0]),
+                            int(cpu_id_range[1]) + 1))
+
+            else:
+                # Check that the ID is actually valid
+                id = int(cpu_str_arr[i])
+                if id < 0 or id >= max_cpu_id:
+                    print("The CPU ID '%s' is not a valid.  The valid "
+                          "CPU IDs of this machine are those in the range "
+                          "0 - %d" % (cpu_str_arr[i], max_cpu_id))
+                    sys.exit(1)
+                cpu_ids.add(id)
+
+        except ValueError:
+            print("Entered CPU ID / range (%s) has non-integer "
+                  "values" % cpu_str_arr[i])
+            sys.exit(1)
+
+    return cpu_ids
+
+
+def allocate_region(remaining_regions, chosen_regions, name):
+    phys_start = get_addr_input("starting physical")
+    phys_end = get_addr_input("ending physical")
+    virt_start = get_addr_input("starting virtual (guest physical)")
+
+    new_reg = sysfs_parser.MemRegion(phys_start, phys_end, 'System RAM',
+                                     virt_start=virt_start, comments=name)
+
+    # =======================
+    # Physical address checks
+    # =======================
+
+    if (phys_end < phys_start):
+        print("The starting physical address (%08x) is greater than the "
+              "ending physical address (%08x)" % (phys_start, phys_end))
+        return False
+
+    # Check to see that phyiscal addr lies within a block
+    highest_p_addr_reg = -1  # Index of phys addr region we want to break up
+    for i in range(len(remaining_regions)):
+        if new_reg.start < remaining_regions[i].start:
+            break
+        highest_p_addr_reg = i
+
+    if highest_p_addr_reg == -1:
+        print("The starting address for this physical region (%08x) is "
+              "less than the starting addr. of the lowest-physically "
+              "addressed available region (%08x)" %
+              (new_reg.start, remaining_regions[0].start))
+        return False
+
+    intersecting_p_reg = remaining_regions[highest_p_addr_reg]
+    if intersecting_p_reg.stop < new_reg.stop:
+        print("Selected physical region (%08x - %08x) does not lie "
+              "within the bounds of a free region" %
+              (phys_start, phys_end))
+        return False
+
+    # =======================
+    # Virtual address checks
+    # =======================
+
+    # Check to see that v-addr doesn't intersect currently assigned block
+    highest_v_addr_reg = 0  # Index of v-addr region to come after new_reg
+    for i in range(len(chosen_regions)):
+        l_bound_overlap = new_reg.virt_start < chosen_regions[i].virt_start + \
+            chosen_regions[i].size() and chosen_regions[i].virt_start <= \
+            new_reg.virt_start
+
+        r_bound_overlap = chosen_regions[i].virt_start < new_reg.virt_start + \
+            new_reg.size() and new_reg.virt_start + new_reg.size() <= \
+            chosen_regions[i].virt_start + chosen_regions[i].size()
+
+        if l_bound_overlap or r_bound_overlap:
+            print("Selected virtual region (%08x - %08x) intersects an "
+                  "already allocated virtual region\n" % (new_reg.virt_start,
+                                                          new_reg.virt_start +
+                                                          new_reg.size() - 1))
+            return False
+
+        if new_reg.virt_start + new_reg.size() <= chosen_regions[i].virt_start:
+            break
+        highest_v_addr_reg += 1
+
+    # =======================
+    # Create regions
+    # =======================
+
+    # Break up remaining_regions
+
+    # We're using the entire region, delete it
+    if new_reg.start == intersecting_p_reg.start and \
+            new_reg.size() == intersecting_p_reg.size():
+        del remaining_regions[highest_p_addr_reg:highest_p_addr_reg + 1]
+
+    # We're using one of two endpoints of the enclosing physical region, shrink
+    # the region accordingly
+    elif new_reg.start == intersecting_p_reg.start:
+        intersecting_p_reg.start += new_reg.size()
+
+    elif new_reg.start + new_reg.size() == intersecting_p_reg.start + \
+            intersecting_p_reg.size():
+        intersecting_p_reg.stop = new_reg.start - 1
+
+    # The requested region uses neither endpoint of the containing region,
+    # break it up into two new regions
+    else:
+        new_phys_reg = sysfs_parser.MemRegion(intersecting_p_reg.start,
+                                              new_reg.start - 1,
+                                              'System RAM', comments=name,
+                                              virt_start=virt_start)
+        remaining_regions.insert(highest_p_addr_reg, new_phys_reg)
+        intersecting_p_reg.start = new_reg.stop + 1
+
+    # Add a new block to chosen_regions (sorted by v-addr)
+    chosen_regions.insert(highest_v_addr_reg, new_reg)
+
+    return True
+
+
+parser = argparse.ArgumentParser(description="Generate a config file for a "
+                                 "non-root cell")
+
+parser.add_argument("--name", required=True, help="The name for this cell.")
+
+parser.add_argument("--cpus", required=True, action='append',
+                    metavar="[<id> | <id>-<id>]", nargs="+",
+                    help="The IDs of CPUs you'd like a cell to have. "
+                    "Indivdual CPUs can be specified by giving a space "
+                    "separated list of their numeric IDs. Ranges of CPUs "
+                    "can be specified using <id>-<id> (inclusive).")
+
+parser.add_argument("--ram", required=True, nargs=3, action='append',
+                    metavar=('<phys_start>', '<virt_start>', '<size>'),
+                    help="The starting physical address, starting virtual "
+                    "(guest physical) address and size of a RAM memory "
+                    "region for a cell. Values must be in hexidecimal.")
+
+# Note: this will generate a memory region within the config itself, and should
+# be mapped
+parser.add_argument("--mmio", nargs=3, action='append',
+                    metavar=('<phys_start>', '<virt_start>', '<size>'),
+                    help="The starting physical address, starting virtual "
+                    "(guest physical) address and size of an MMIO memory "
+                    "region for a cell. Values must be in hexidecimal.")
+
+parser.add_argument("--pci", action='append', metavar="<domain>:<bus>:<device>"
+                    ".<function>", help="The domain:b:d.f address of a PCI "
+                    "device you'd like a cell to have.  Values must be "
+                    "in hexidecimal.")
+
+# This only applies to x86 feature - if this argument is supplied, we check
+# to ensure that this is indeed an x86 processor
+parser.add_argument("--pio-bitmap", nargs=3, action='append',
+                    metavar=('<start>', '<end>', '<value>'), help="The "
+                    "starting and ending address of the bits in a PIO "
+                    "bitmap and the values you want to initialize them "
+                    "with.  Only present on x86 processors.")
+
+args = parser.parse_args()
+if args.pio_bitmap is not None:
+    vendor = sysfs_parser.get_cpu_vendor()
+    if vendor != "GenuineIntel" and vendor != "AuthenticAMD":
+        print("PIO is an x86 only feature - please remove the --pio-bitmap "
+              "option.")
+        sys.exit(1)
+
+cpu_ids = allocate_cpus(args.cpus)
+
+
+# still_creating_cell = True
+# available_cpus = set([i for i in range(cpucount)])
+# # Array of physical regions a guest can use for RAM. Last element of
+# # regions array contains memory set aside for guest RAM.
+# remaining_regions = [regions[-1]]
+# remaining_regions[0].typestr = "System RAM"
+# used_names = []
+
+# while still_creating_cell:
+#     cpu_bitmaps = []  # Array of CPU bitmap strings
+#     chosen_regions = []  # Array of memory (for RAM) reserved for a guest
+#                          # TODO/ note: currently ordered by virtual address
+#                          # due to the way array is used in allocate_region
+
+
+#     print("\n=======\nCPU Set\n=======")
+#     # Get CPUs
+#     while True:
+#         cpu_str_arr_correct = True
+#         print("The following CPUs are available:")
+#         print(available_cpus)
+#         print("Enter a comma separated list of the ones you want - "
+#               "'..' can be used to indicate a range of cpus (e.g., "
+#               "'0..3, 7' is equivalent to '0, 1, 2, 3, 7'):")
+#         cpu_str_arr = get_input().split(",")
+#     # Check for resources - if they're all exhausted, exit
+#     if len(available_cpus) == 0:
+#         print("All CPUs are now marked as reserved, finishing")
+#         break
+#         # Expand all ranges, make sure all inputs are integers
+#         for i in range(len(cpu_str_arr) - 1, -1, -1):
+#             try:
+#                 if ".." in cpu_str_arr[i]:
+#                     arr = cpu_str_arr[i].split("..")
+#                     cpu_str_arr += range(int(arr[0]), int(arr[1]) + 1)
+#                     del cpu_str_arr[i:i+1]
+#                 else:
+#                     int(cpu_str_arr[i])
+
+#             except ValueError:
+#                 print("Entered CPU ID / range (%s) has non-integer "
+#                       "values" % cpu_str_arr[i])
+#                 cpu_str_arr_correct = False
+#                 break
+
+#         # cpu_str_arr now a list of integers, check that intersection of
+#         # cpu_str_arr and available_cpus is non-empty, then reserve CPUs
+#         # in intersection
+#         if cpu_str_arr_correct:
+#             cpu_str_arr = set([int(cpu_id) for cpu_id in cpu_str_arr]) & \
+#                 available_cpus
+
+#             if len(cpu_str_arr) == 0:
+#                 print("None of the CPUs you chose are available.")
+#                 continue
+
+#             available_cpus = available_cpus - cpu_str_arr
+
+#             # Create needed number of 16 hex digit bitmaps indicating
+#             # CPUs are in use
+#             chosen_cpus = 0
+#             for cpu in cpu_str_arr:
+#                 chosen_cpus += 2**cpu
+
+#             while chosen_cpus != 0:
+#                 cpu_bitmaps.append('0x%016x' % (chosen_cpus % 2**64))
+#                 chosen_cpus = chosen_cpus // (2**64)
+
+#             break
+
+#     # Get RAM
+#     print("\n=======\nRAM\n=======")
+#     print_remaining_regions(remaining_regions)
+
+#     num_regions = get_integer_input("How many regions would you like "
+#                                     "to create from it (must select "
+#                                     "at least one region)?")
+
+#     for i in range(num_regions):
+#         print("\n=======\nRegion %d\n=======" % (i + 1))
+#         print("Choose a name for this region (optional, only appears "
+#               "as comment in generated file):")
+#         region_name = get_input()
+
+#         while True:
+#             if allocate_region(remaining_regions, chosen_regions,
+#                                region_name):
+#                 break
+
+#         if len(remaining_regions) == 0:
+#             break
+
+#         print_remaining_regions(remaining_regions)
+
+#     # Write out config
+#     with open(name + ".c", 'w') as f:
+#         tmpl = Template(filename=os.path.join(options.template_dir,
+#                         'non-root-cell-config.c.tmpl'))
+#         kwargs = {
+#             'name': name,
+#             'cpu_bitmaps': cpu_bitmaps,
+#             'chosen_mem_regions': chosen_regions
+#         }
+#         f.write(tmpl.render(**kwargs))
+
+#     # Check for resources - if they're all exhausted, exit
+#     if len(available_cpus) == 0:
+#         print("All CPUs are now marked as reserved, finishing")
+#         break
+
+#     if len(remaining_regions) == 0:
+#         print("All inmate RAM is now depleted, finishing")
+#         break
+
+
+
+# ======================================
+# A non-descript dump of stuff as of 07/03/19 - this will be duplicates of the above
+# ======================================
+#
+# def get_input():  # input() in Python3 == raw_input() in Python2
+#     # TODO: try / except block, loop used for development purposes, remove
+#     while True:
+#         try:
+#             if sys.version_info[0] == 2:
+#                 return raw_input()
+#             else:  # version_info[0] == 3
+#                 return input()
+#         except EOFError:
+#             continue
+
+
+# def get_integer_input(prompt):
+#     while True:
+#         print(prompt)
+#         try:
+#             val = int(get_input())
+#             if val <= 0:
+#                 print("Inputed value needs to be a positive integer\n")
+#                 continue
+#         except ValueError:
+#             print("Inputed value needs to be an integer\n")
+#             continue
+
+#         return val
+
+
+# if options.create_non_root:
+#     still_creating_cell = True
+#     available_cpus = set([i for i in range(cpucount)])
+#     used_names = []
+
+#     while still_creating_cell:
+#         name = ""
+#         cpu_bitmaps = []  # Array of CPU bitmap strings
+
+#         # Choose name
+#         print("\n=======\nName\n=======")
+#         while True:
+#             print("Enter a unique name for this cell:")
+#             name = get_input()
+#             if name in used_names:
+#                 print("%s is already in use as a cell name" % name)
+#                 continue
+#             used_names.append(name)
+#             break
+
+#         print("\n=======\nCPU Set\n=======")
+#         # Get CPUs
+#         while True:
+#             cpu_str_arr_correct = True
+#             print("The following CPUs are available:")
+#             print(available_cpus)
+#             print("Enter a comma separated list of the ones you want - "
+#                   "'..' can be used to indicate a range of cpus (e.g., "
+#                   "'0..3, 7' is equivalent to '0, 1, 2, 3, 7'):")
+#             cpu_str_arr = get_input().split(",")
+
+#             # Expand all ranges, make sure all inputs are integers
+#             for i in range(len(cpu_str_arr) - 1, -1, -1):
+#                 try:
+#                     if ".." in cpu_str_arr[i]:
+#                         arr = cpu_str_arr[i].split("..")
+#                         cpu_str_arr += range(int(arr[0]), int(arr[1]) + 1)
+#                         del cpu_str_arr[i:i+1]
+#                     else:
+#                         int(cpu_str_arr[i])
+
+#                 except ValueError:
+#                     print("Entered CPU ID / range (%s) has non-integer "
+#                           "values" % cpu_str_arr[i])
+#                     cpu_str_arr_correct = False
+#                     break
+
+#             # cpu_str_arr now a list of integers, check that intersection of
+#             # cpu_str_arr and available_cpus is non-empty, then reserve CPUs
+#             # in intersection
+#             if cpu_str_arr_correct:
+#                 cpu_str_arr = set([int(cpu_id) for cpu_id in cpu_str_arr]) & \
+#                     available_cpus
+
+#                 if len(cpu_str_arr) == 0:
+#                     print("None of the CPUs you chose are available.")
+#                     continue
+
+#                 available_cpus = available_cpus - cpu_str_arr
+
+#                 # Create needed number of 16 hex digit bitmaps indicating
+#                 # CPUs are in use
+#                 chosen_cpus = 0
+#                 for cpu in cpu_str_arr:
+#                     chosen_cpus += 2**cpu
+
+#                 while chosen_cpus != 0:
+#                     cpu_bitmaps.append('0x%016x' % (chosen_cpus % 2**64))
+#                     chosen_cpus = chosen_cpus // (2**64)
+
+#                 break
+
+#         # Write out config
+#         with open(name + ".c", 'w') as f:
+#             tmpl = Template(filename=os.path.join(options.template_dir,
+#                             'non-root-cell-config.c.tmpl'))
+#             kwargs = {
+#                 'name': name,
+#                 'cpu_bitmaps': cpu_bitmaps
+#             }
+#             f.write(tmpl.render(**kwargs))
+
+#         # Check for resources - if they're all exhausted, exit
+#         if len(available_cpus) == 0:
+#             print("All CPUs are now marked as reserved, finishing")
+#             break
+
+#         while True:
+#             print("\nWould you like to create another non-root cell [y/n]")
+#             s = get_input().lower()
+#             if s != "y" and s != "n":
+#                 continue
+#             if s == "n":
+#                 still_creating_cell = False
+#             print("")
+#             break
+
+# ######################################
+
+# # Write out root cell
+# with open(options.file, 'w') as f:
+#     tmpl = Template(filename=os.path.join(options.template_dir,
+#                                           'root-cell-config.c.tmpl'))
+#     kwargs = {
+#         'regions': regions,
+#         'ourmem': ourmem,
+#         'argstr': ' '.join(sys.argv),
+#         'hvmem': hvmem,
+#         'product': product,
+#         'pcidevices': pcidevices,
+#         'pcicaps': pcicaps,
+#         'cpucount': cpucount,
+#         'irqchips': ioapics,
+#         'pm_timer_base': pm_timer_base,
+#         'vtd_interrupt_limit': vtd_interrupt_limit,
+#         'mmconfig': mmconfig,
+#         'iommu_units': iommu_units,
+#         'debug_console': debug_console,
+#     }
+
+#     f.write(tmpl.render(**kwargs))
